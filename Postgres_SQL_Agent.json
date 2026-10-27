@@ -1,0 +1,398 @@
+{
+  "name": "Postgres SQL Agent",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Manual Test",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1100,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ask-db",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook (POST /ask-db)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1100,
+        100
+      ],
+      "webhookId": "ask-db"
+    },
+    {
+      "parameters": {
+        "jsCode": "const b = $input.first().json.body || {};\nreturn [{ json: { question: String(b.question || 'Which 5 customers spent the most in the last 90 days?').slice(0, 500) } }];"
+      },
+      "name": "Question",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position LIMIT 600;",
+        "options": {}
+      },
+      "name": "Get Schema",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -660,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Postgres (read-only user)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compact the schema and ask for one read-only PostgreSQL query.\nconst q = $('Question').first().json.question;\nconst tables = {};\nfor (const r of $input.all()) { const j = r.json; if (!j.table_name) continue; (tables[j.table_name] = tables[j.table_name] || []).push(`${j.column_name} ${j.data_type}`); }\nconst schema = Object.entries(tables).map(([t, c]) => `${t}(${c.join(', ')})`).join('\\n');\nconst prompt = `You write PostgreSQL for a read-only analytics assistant.\nSchema (public):\n${schema || '(no tables found)'}\n\nQuestion: ${q}\n\nRules: exactly ONE statement, SELECT or WITH ... SELECT only, never modify data, use only tables/columns from the schema,\nalways LIMIT 100 or less, prefer readable column aliases. If the question cannot be answered from the schema, return sql \"\" and explain why.\nReturn JSON only: {\"sql\": \"...\", \"explanation\": \"one sentence\"}`;\nreturn [{ json: { question: q, schema, requestBody: { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json' } } } }];"
+      },
+      "name": "Build SQL Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Gemini: Write SQL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -220,
+        0
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "",
+          "name": "Gemini API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Second line of defence (the first is a read-only DB user): allow a single SELECT/WITH statement only.\nconst q = $('Build SQL Prompt').first().json.question;\nlet ai = {};\ntry { ai = JSON.parse($input.first().json.candidates?.[0]?.content?.parts?.[0]?.text || '{}'); } catch (e) { ai = {}; }\nlet sql = String(ai.sql || '').trim();\nconst reject = (reason) => [{ json: { ok: false, question: q, sql, reason, explanation: ai.explanation || '' } }];\nif (!sql) return reject(ai.explanation || 'The model could not write a query for this question.');\nconst stripped = sql.replace(/--[^\\n]*/g, ' ').replace(/\\/\\*[\\s\\S]*?\\*\\//g, ' ').replace(/'(?:[^']|'')*'/g, \"''\").trim().replace(/;\\s*$/, '');\nif (stripped.includes(';')) return reject('Multiple statements are not allowed.');\nif (!/^(select|with)\\b/i.test(stripped)) return reject('Only SELECT queries are allowed.');\nconst banned = /\\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|copy|vacuum|analyze|call|do|execute|prepare|lock|comment|refresh|reindex|cluster|set|reset|listen|notify|pg_sleep|pg_terminate_backend|pg_cancel_backend|dblink|lo_import|lo_export)\\b/i;\nconst hit = stripped.match(banned);\nif (hit) return reject(`Keyword \"${hit[1]}\" is not allowed in a read-only query.`);\nsql = sql.trim().replace(/;\\s*$/, '');\nconst lim = stripped.match(/\\blimit\\s+(\\d+)\\s*$/i);\nif (!lim) sql += ' LIMIT 100'; else if (Number(lim[1]) > 100) sql = sql.replace(/\\blimit\\s+\\d+\\s*$/i, 'LIMIT 100');\nreturn [{ json: { ok: true, question: q, sql, explanation: ai.explanation || '' } }];"
+      },
+      "name": "SQL Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Safe?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      },
+      "name": "Run Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        -100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Postgres (read-only user)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ask Gemini to explain the rows in plain language (first 50 rows only).\nconst g = $('SQL Guard').first().json;\nconst rows = $input.all().map(i => i.json).filter(r => Object.keys(r).length);\nconst prompt = `Question: ${g.question}\nSQL used: ${g.sql}\nResult (${rows.length} rows, first 50 shown):\n${JSON.stringify(rows.slice(0, 50))}\n\nAnswer the question in 2-4 sentences using only these rows. If the result is empty, say so plainly.`;\nreturn [{ json: { rows: rows.slice(0, 100), rowCount: rows.length, requestBody: { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2 } } } }];"
+      },
+      "name": "Build Answer Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Gemini: Explain",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        -100
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "",
+          "name": "Gemini API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('SQL Guard').first().json;\nconst r = $('Build Answer Prompt').first().json;\nconst answer = $input.first().json.candidates?.[0]?.content?.parts?.[0]?.text || '';\nreturn [{ json: { ok: true, question: g.question, sql: g.sql, rowCount: r.rowCount, rows: r.rows, answer } }];"
+      },
+      "name": "Final Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "name": "Respond: Answer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, question: $json.question, reason: $json.reason, sql: $json.sql }) }}",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "name": "Respond: Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Test": {
+      "main": [
+        [
+          {
+            "node": "Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook (POST /ask-db)": {
+      "main": [
+        [
+          {
+            "node": "Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Question": {
+      "main": [
+        [
+          {
+            "node": "Get Schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Schema": {
+      "main": [
+        [
+          {
+            "node": "Build SQL Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build SQL Prompt": {
+      "main": [
+        [
+          {
+            "node": "Gemini: Write SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: Write SQL": {
+      "main": [
+        [
+          {
+            "node": "SQL Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SQL Guard": {
+      "main": [
+        [
+          {
+            "node": "Safe?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Safe?": {
+      "main": [
+        [
+          {
+            "node": "Run Query",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Query": {
+      "main": [
+        [
+          {
+            "node": "Build Answer Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Answer Prompt": {
+      "main": [
+        [
+          {
+            "node": "Gemini: Explain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: Explain": {
+      "main": [
+        [
+          {
+            "node": "Final Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Final Answer": {
+      "main": [
+        [
+          {
+            "node": "Respond: Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
